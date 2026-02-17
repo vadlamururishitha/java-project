@@ -1,0 +1,300 @@
+import java.io.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+/**
+ * Single-file console Banking Application.
+ * Save as BankingApp.java, then:
+ *   javac BankingApp.java
+ *   java BankingApp
+ *
+ * Data persisted to "bank.dat" in working directory.
+ */
+public class BankingApp {
+
+    // ---------------------- Transaction ----------------------
+    public static class Transaction implements Serializable {
+        private static final long serialVersionUID = 1L;
+        public enum Type { DEPOSIT, WITHDRAW, TRANSFER_IN, TRANSFER_OUT }
+        private final Type type;
+        private final double amount;
+        private final LocalDateTime timestamp;
+        private final String note;
+
+        public Transaction(Type type, double amount, String note) {
+            this.type = type;
+            this.amount = amount;
+            this.note = note == null ? "" : note;
+            this.timestamp = LocalDateTime.now();
+        }
+
+        public Type getType() { return type; }
+        public double getAmount() { return amount; }
+        public LocalDateTime getTimestamp() { return timestamp; }
+        public String getNote() { return note; }
+
+        @Override
+        public String toString() {
+            DateTimeFormatter f = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+            return String.format("[%s] %s: %.2f %s", timestamp.format(f), type, amount, note.isEmpty() ? "" : "- " + note);
+        }
+    }
+
+    // ---------------------- Account ----------------------
+    public static class Account implements Serializable {
+        private static final long serialVersionUID = 1L;
+        private final String accountId;
+        private final String ownerName;
+        private double balance;
+        private final List<Transaction> transactions = new ArrayList<>();
+
+        public Account(String ownerName, double initialDeposit) {
+            this.accountId = UUID.randomUUID().toString();
+            this.ownerName = ownerName == null ? "Unknown" : ownerName;
+            this.balance = Math.max(0.0, initialDeposit);
+            if (initialDeposit > 0) {
+                transactions.add(new Transaction(Transaction.Type.DEPOSIT, initialDeposit, "Initial deposit"));
+            }
+        }
+
+        public String getAccountId() { return accountId; }
+        public String getOwnerName() { return ownerName; }
+
+        public synchronized double getBalance() { return balance; }
+
+        public synchronized void deposit(double amt, String note) {
+            if (amt <= 0) throw new IllegalArgumentException("Deposit amount must be positive");
+            balance += amt;
+            transactions.add(new Transaction(Transaction.Type.DEPOSIT, amt, note));
+        }
+
+        public synchronized boolean withdraw(double amt, String note) {
+            if (amt <= 0) throw new IllegalArgumentException("Withdraw amount must be positive");
+            if (amt > balance) return false;
+            balance -= amt;
+            transactions.add(new Transaction(Transaction.Type.WITHDRAW, amt, note));
+            return true;
+        }
+
+        public synchronized void addTransaction(Transaction t) {
+            if (t != null) transactions.add(t);
+        }
+
+        public synchronized List<Transaction> getTransactions() {
+            return Collections.unmodifiableList(new ArrayList<>(transactions));
+        }
+
+        @Override
+        public String toString() {
+            return String.format("Account[%s] Owner: %s, Balance: %.2f", accountId.substring(0,8), ownerName, balance);
+        }
+    }
+
+    // ---------------------- Bank ----------------------
+    public static class Bank implements Serializable {
+        private static final long serialVersionUID = 1L;
+        private final Map<String, Account> accounts = new HashMap<>();
+
+        public synchronized Account createAccount(String ownerName, double initialDeposit) {
+            Account a = new Account(ownerName, initialDeposit);
+            accounts.put(a.getAccountId(), a);
+            return a;
+        }
+
+        public synchronized Account getAccountById(String accountId) {
+            return accounts.get(accountId);
+        }
+
+        public synchronized List<Account> listAccounts() {
+            return new ArrayList<>(accounts.values());
+        }
+
+        public synchronized boolean deposit(String accountId, double amount) {
+            Account a = accounts.get(accountId);
+            if (a == null) return false;
+            a.deposit(amount, "Deposit via Bank");
+            return true;
+        }
+
+        public synchronized boolean withdraw(String accountId, double amount) {
+            Account a = accounts.get(accountId);
+            if (a == null) return false;
+            return a.withdraw(amount, "Withdraw via Bank");
+        }
+
+        public synchronized boolean transfer(String fromId, String toId, double amount) {
+            if (fromId == null || toId == null || fromId.equals(toId)) return false;
+            Account from = accounts.get(fromId);
+            Account to = accounts.get(toId);
+            if (from == null || to == null) return false;
+            if (amount <= 0) return false;
+
+            // Lock ordering to avoid deadlock: compare accountId strings
+            Account first = fromId.compareTo(toId) < 0 ? from : to;
+            Account second = first == from ? to : from;
+
+            synchronized (first) {
+                synchronized (second) {
+                    if (from.getBalance() < amount) return false;
+                    boolean withdrew = from.withdraw(amount, "Transfer to " + toId);
+                    if (!withdrew) return false;
+                    to.deposit(amount, "Transfer from " + fromId);
+                    from.addTransaction(new Transaction(Transaction.Type.TRANSFER_OUT, amount, "To " + toId));
+                    to.addTransaction(new Transaction(Transaction.Type.TRANSFER_IN, amount, "From " + fromId));
+                    return true;
+                }
+            }
+        }
+
+        public synchronized void saveToFile(String filename) throws IOException {
+            try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream(filename))) {
+                oos.writeObject(this);
+            }
+        }
+
+        public static Bank loadFromFile(String filename) throws IOException, ClassNotFoundException {
+            File f = new File(filename);
+            if (!f.exists()) return new Bank();
+            try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(f))) {
+                Object obj = ois.readObject();
+                if (obj instanceof Bank) return (Bank) obj;
+                return new Bank();
+            }
+        }
+    }
+
+    // ---------------------- Main application ----------------------
+    private static final String DATA_FILE = "bank.dat";
+    private static Bank bank;
+    private static final Scanner sc = new Scanner(System.in);
+
+    public static void main(String[] args) {
+        // load data
+        try {
+            bank = Bank.loadFromFile(DATA_FILE);
+            System.out.println("Loaded bank data from " + DATA_FILE + " (if file existed).");
+        } catch (Exception e) {
+            System.out.println("No previous data found or failed to load. Starting new bank.");
+            bank = new Bank();
+        }
+
+        boolean run = true;
+        while (run) {
+            printMenu();
+            String choice = sc.nextLine().trim();
+            switch (choice) {
+                case "1": createAccount(); break;
+                case "2": listAccounts(); break;
+                case "3": deposit(); break;
+                case "4": withdraw(); break;
+                case "5": transfer(); break;
+                case "6": accountDetails(); break;
+                case "7": saveAndExit(); run = false; break;
+                default: System.out.println("Invalid choice. Enter 1-7.");
+            }
+        }
+    }
+
+    private static void printMenu() {
+        System.out.println("\n=== Simple Banking App ===");
+        System.out.println("1) Create account");
+        System.out.println("2) List accounts");
+        System.out.println("3) Deposit");
+        System.out.println("4) Withdraw");
+        System.out.println("5) Transfer");
+        System.out.println("6) Account details & transactions");
+        System.out.println("7) Save & Exit");
+        System.out.print("Choose: ");
+    }
+
+    private static void createAccount() {
+        System.out.print("Owner name: ");
+        String name = sc.nextLine().trim();
+        if (name.isEmpty()) name = "Unknown";
+        System.out.print("Initial deposit: ");
+        double init = readDouble();
+        Account a = bank.createAccount(name, init);
+        System.out.println("Created: " + a);
+        System.out.println("Full Account ID (copy when needed): " + a.getAccountId());
+    }
+
+    private static void listAccounts() {
+        List<Account> list = bank.listAccounts();
+        if (list.isEmpty()) {
+            System.out.println("No accounts.");
+            return;
+        }
+        System.out.println("Accounts:");
+        for (Account a : list) {
+            System.out.println(a.getAccountId().substring(0,8) + " | " + a.getOwnerName() + " | Balance: " + String.format("%.2f", a.getBalance()) + " | FullID: " + a.getAccountId());
+        }
+    }
+
+    private static void deposit() {
+        System.out.print("Account ID: ");
+        String id = sc.nextLine().trim();
+        System.out.print("Amount: ");
+        double amt = readDouble();
+        boolean ok = bank.deposit(id, amt);
+        System.out.println(ok ? "Deposited successfully." : "Account not found.");
+    }
+
+    private static void withdraw() {
+        System.out.print("Account ID: ");
+        String id = sc.nextLine().trim();
+        System.out.print("Amount: ");
+        double amt = readDouble();
+        boolean ok = bank.withdraw(id, amt);
+        System.out.println(ok ? "Withdrawn successfully." : "Failed (insufficient funds or account missing).");
+    }
+
+    private static void transfer() {
+        System.out.print("From Account ID: ");
+        String from = sc.nextLine().trim();
+        System.out.print("To Account ID: ");
+        String to = sc.nextLine().trim();
+        System.out.print("Amount: ");
+        double amt = readDouble();
+        boolean ok = bank.transfer(from, to, amt);
+        System.out.println(ok ? "Transfer successful." : "Transfer failed (check IDs/balance).");
+    }
+
+    private static void accountDetails() {
+        System.out.print("Account ID: ");
+        String id = sc.nextLine().trim();
+        Account a = bank.getAccountById(id);
+        if (a == null) {
+            System.out.println("Account not found.");
+            return;
+        }
+        System.out.println(a);
+        System.out.println("Transactions:");
+        for (Transaction t : a.getTransactions()) {
+            System.out.println("  " + t);
+        }
+    }
+
+    private static void saveAndExit() {
+        try {
+            bank.saveToFile(DATA_FILE);
+            System.out.println("Saved to " + DATA_FILE);
+        } catch (IOException e) {
+            System.err.println("Failed to save: " + e.getMessage());
+        }
+        System.out.println("Goodbye.");
+    }
+
+    private static double readDouble() {
+        while (true) {
+            String s = sc.nextLine().trim();
+            try {
+                double v = Double.parseDouble(s);
+                if (Double.isFinite(v)) return v;
+                System.out.print("Enter a valid number: ");
+            } catch (NumberFormatException e) {
+                System.out.print("Invalid number. Enter again: ");
+            }
+        }
+    }
+}
